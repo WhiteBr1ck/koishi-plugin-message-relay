@@ -1,0 +1,39 @@
+{
+  "name": "koishi-plugin-message-relay",
+  "version": "1.0.0",
+  "description": "一个在不同群组之间，监控并同步用户消息的 Koishi 插件。",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "author": "WhiteBr1ck (https://github.com/WhiteBr1ck)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WhiteBr1ck/koishi-plugin-message-relay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WhiteBr1ck/koishi-plugin-message-relay/issues"
+  },
+  "homepage": "https://github.com/WhiteBr1ck/koishi-plugin-message-relay#readme",
+  "keywords": [
+    "koishi",
+    "plugin",
+    "relay",
+    "forward",
+    "monitor",
+    "message",
+    "channel",
+    "group"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.0.0"
+  },
+  "koishi": {
+    "description": {
+      "zh": "传声筒，用于在不同群组之间监控并同步某个用户的发言，支持手动指引 bot 发送特定消息。"
+    }
+  }
+}
