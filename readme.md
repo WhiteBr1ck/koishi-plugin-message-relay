@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/koishi-plugin-message-relay)](https://www.npmjs.com/package/koishi-plugin-message-relay)
 [![license](https://img.shields.io/npm/l/koishi-plugin-message-relay)](https://github.com/WhiteBr1ck/koishi-plugin-message-relay/blob/main/LICENSE)
 
-一个在不同群组之间，监控并同步用户消息的 Koishi 插件。
+一个在不同群组之间，监控并同步用户消息的 Koishi 插件。支持指令调用。
 
 ## ✨ 功能特性
 
@@ -12,6 +12,7 @@
 - **图片支持**: 能够正确转发包括文本、图片、文件、at在内的多种消息类型。
 - **支持群昵称**: 在转发消息时，优先获取并使用发言者在**目标群聊**的群昵称。
 - **手动转发指令**: 提供 `传话筒` 指令，允许管理员手动向指定群聊发送消息，此外还能支持 QQ 的引用功能。
+- **引用转发功能**: 支持自定义引用转发指令，可引用任意消息进行转发。
 - **支持群名称发送**: `传话筒` 指令支持通过**序号**、**群名称**或**群号**来指定目标。
 - **调试模式**: 内置 Debug 开关，方便在需要时开启详细的日志以供排查。
 
@@ -37,6 +38,16 @@
 - **commandAuthLevel**: `number` - 能够使用 `传话筒` 指令的最低权限等级。默认为 `3`。
 - **defaultPlatform**: `string` - 手动传话时，如果未提供平台前缀，则使用此平台名称。默认为 `onebot`。
 
+### 引用转发设置
+
+- **quotedRelayEnabled**: `boolean` - 是否启用引用转发功能。默认为 `false`。
+- **quotedRelayRules**: 引用转发规则列表。这是一个数组，每一项都代表一条独立的引用转发指令。
+  - **commandName**: `string` - 指令名称 (如 `搬史`)。
+  - **targetChannels**: `string[]` - 目标转发频道列表 (需要带平台前缀，如 `onebot:12345678`)。
+  - **excludeSource**: `boolean` - 是否排除来源群 (即不向发送指令的群聊转发)。默认为 `true`。
+  - **showSuccessMessage**: `boolean` - 是否显示转发成功提示。默认为 `true`。
+  - **showOriginalSender**: `boolean` - 是否显示原消息发送者信息。默认为 `true`。
+
 ### 高级设置
 
 - **debug**: `boolean` - 是否在控制台输出详细的调试日志。默认为 `false`。
@@ -51,6 +62,14 @@
   - 功能: 手动发送消息到指定的目标群聊。
   - `<目标>`: 可以是 `支持的群聊` 指令中列出的**序号**、**群名称**或**群号**。
   - `<内容>`: 你想要发送的文本内容。
+
+- **引用转发指令 (可自定义)(目前仅再onebot平台做过测试)**
+  - 功能: 引用(回复)任意消息后使用自定义指令进行转发。
+  - 使用方法: 
+    1. 引用(回复)要转发的消息
+    2. 发送配置的指令名称 (如 `搬史`)
+    3. 或者直接使用指令加内容 (如 `搬史 这是要发送的内容`)
+  - 支持内容: 文本、图片、视频、语音、文件、@某人、表情、合并转发等所有消息类型
 
 ## ✍️ 作者
 

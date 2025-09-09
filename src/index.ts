@@ -1,4 +1,4 @@
-import { Context, Schema } from 'koishi'
+import { Context, Schema, h } from 'koishi'
 
 export const name = 'message-relay'
 
@@ -11,12 +11,25 @@ interface MonitoringRule {
   keywords: string[]
   relayTargetChannels: string[]
 }
+
+interface QuotedRelayRule {
+  commandName: string
+  targetChannels: string[]
+  excludeSource: boolean
+  showSuccessMessage: boolean
+  showOriginalSender: boolean
+}
+
 export interface Config {
   monitoringRules: MonitoringRule[]
   manualRelayAllowedChannels: string[]
   commandAuthLevel: number
   defaultPlatform: string
   debug: boolean
+  // 引用转发设置
+  quotedRelayEnabled: boolean
+  quotedRelayAuthLevel: number
+  quotedRelayRules: QuotedRelayRule[]
 }
 export const Config = Schema.intersect([
   Schema.object({
@@ -31,6 +44,17 @@ export const Config = Schema.intersect([
     commandAuthLevel: Schema.number().min(0).max(5).default(3).description('能够使用「传话筒」指令的最低权限等级。'),
     defaultPlatform: Schema.string().default('onebot').description('手动传话时，默认使用的平台名称。'),
   }).description('手动指令设置'),
+  Schema.object({
+    quotedRelayEnabled: Schema.boolean().default(false).description('是否启用引用转发功能。'),
+    quotedRelayAuthLevel: Schema.number().min(0).max(5).default(3).description('能够使用引用转发指令的最低权限等级。'),
+    quotedRelayRules: Schema.array(Schema.object({
+      commandName: Schema.string().description('指令名称。'),
+      targetChannels: Schema.array(Schema.string()).role('channel').description('该指令对应的目标群组列表 (需要带平台前缀，如 onebot:12345678)。'),
+      excludeSource: Schema.boolean().default(true).description('是否排除消息来源群聊（避免转发回同一群）。'),
+      showSuccessMessage: Schema.boolean().default(true).description('转发完成后是否发送转发成功消息。'),
+      showOriginalSender: Schema.boolean().default(true).description('是否显示原消息发送者的昵称。'),
+    })).role('table').default([]).description('引用转发指令规则列表。'),
+  }).description('引用转发设置'),
   Schema.object({
     debug: Schema.boolean().default(false).description('启用后，将在控制台输出详细的调试日志。'),
   }).description('高级设置'),
@@ -157,4 +181,275 @@ export function apply(ctx: Context, config: Config) {
         }
         return response + listItems.join('\n')
     })
+
+  // 新增：引用转发命令（支持多个指令，每个有独立配置）
+  if (config.quotedRelayEnabled && config.quotedRelayRules.length > 0) {
+    for (const rule of config.quotedRelayRules) {
+      ctx.command(rule.commandName + ' [content:text]', '将引用/回复的那条消息转发到已配置的群组，或直接转发输入的内容', { authority: config.quotedRelayAuthLevel })
+        .action(async ({ session }, content) => {
+          const quoted: any = (session as any).quote
+          let messageToSend: string = ''
+          let originalUserId: string = session.userId
+          let sourceDisplayName: string = session.username
+          let isQuotedMessage = false
+
+          if (quoted) {
+            // 引用模式：转发被引用的消息
+            isQuotedMessage = true
+            
+            // 详细日志：输出quoted对象的所有信息
+            if (ctx.config.debug) {
+              logger.info('=== 引用消息调试信息 ===')
+              logger.info('quoted对象:', JSON.stringify(quoted, null, 2))
+              logger.info('quoted.content:', quoted.content)
+              logger.info('quoted.elements:', quoted.elements)
+              logger.info('quoted类型:', typeof quoted)
+              if (quoted.elements) {
+                logger.info('elements详情:')
+                quoted.elements.forEach((element, index) => {
+                  logger.info(`  元素${index}:`, JSON.stringify(element, null, 2))
+                })
+              }
+              logger.info('=== 引用消息调试信息结束 ===')
+            }
+            
+            // 获取被引用消息发送者信息
+            originalUserId = quoted.userId ?? quoted?.author?.userId ?? quoted?.user?.id ?? session.userId
+            sourceDisplayName = quoted?.username ?? quoted?.author?.name ?? quoted?.user?.name ?? session.username
+            
+            // 直接使用原始消息内容，包括合并转发消息
+            try {
+              messageToSend = (quoted.content ?? '').toString().trim()
+            } catch {}
+            
+            if (ctx.config.debug) {
+              logger.info(`提取的messageToSend: "${messageToSend}"`)
+              logger.info(`messageToSend长度: ${messageToSend.length}`)
+            }
+            
+            if (!messageToSend) {
+              return '错误：引用的消息没有可转发的内容。'
+            }
+          } else if (content) {
+            // 直接模式：转发输入的内容
+            messageToSend = content.trim()
+            if (!messageToSend) {
+              return '错误：输入的内容不能为空。'
+            }
+            // 使用当前用户信息
+            originalUserId = session.userId
+            sourceDisplayName = session.username
+          } else {
+            return '请先引用（回复）一条消息再使用该指令，或直接输入要转发的内容。'
+          }
+
+          // 获取发送者在源群的显示名（如果启用显示原发送者）
+          if (rule.showOriginalSender) {
+            try {
+              const member = await session.bot.getGuildMember(session.guildId, originalUserId)
+              if (member?.name) sourceDisplayName = member.name
+              else if (member?.nick) sourceDisplayName = member.nick
+            } catch (error) {
+              if (ctx.config.debug) logger.warn(`(引用转发) 获取源群聊昵称失败:`, error)
+            }
+          }
+
+          // 计算目标频道（可选排除来源群）
+          const fullSourceChannelId = `${session.platform}:${session.channelId}`
+          const targets = (rule.targetChannels ?? []).filter(ch =>
+            rule.excludeSource ? ch !== fullSourceChannelId : true
+          )
+          if (!targets.length) return '尚未配置任何目标群组，或仅剩来源群聊被排除。'
+
+          if (ctx.config.debug) logger.info(`(引用转发) 指令 "${rule.commandName}" 准备转发消息到 ${targets.length} 个目标频道...`)
+          if (ctx.config.debug) logger.info(`待转发的消息内容: "${messageToSend}"`)
+          let successCount = 0
+          for (const targetChannelId of targets) {
+            let finalMessage: string
+            
+            if (rule.showOriginalSender) {
+              // 尝试获取该用户在目标群的昵称
+              let targetDisplayName = sourceDisplayName
+              try {
+                const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+                const targetMember = await session.bot.getGuildMember(plainTargetId, originalUserId)
+                if (targetMember?.name) targetDisplayName = targetMember.name
+                else if (targetMember?.nick) targetDisplayName = targetMember.nick
+              } catch (error) {
+                if (ctx.config.debug) logger.info(`(引用转发) 无法获取用户在目标频道 ${targetChannelId} 的昵称，将使用源群聊昵称。`)
+              }
+              finalMessage = `${targetDisplayName}：${messageToSend}`
+            } else {
+              // 不显示发送者，直接发送内容
+              finalMessage = messageToSend
+            }
+
+            if (ctx.config.debug) logger.info(`向频道 ${targetChannelId} 发送的最终消息: "${finalMessage}"`)
+
+            try {
+              // 对于引用的消息，如果是合并转发等特殊消息，使用OneBot API获取内容
+              if (isQuotedMessage && quoted.elements && quoted.elements.length > 0) {
+                if (ctx.config.debug) logger.info(`检测到引用消息有elements，尝试合并转发处理...`)
+                
+                // 检查是否包含forward元素
+                const hasForwardElement = quoted.elements.some(el => el.type === 'forward')
+                if (hasForwardElement) {
+                  if (ctx.config.debug) logger.info(`检测到forward元素，使用OneBot API获取合并转发内容...`)
+                  
+                  try {
+                    // 检查平台兼容性
+                    if (!['qq', 'onebot'].includes(session.platform)) {
+                      if (ctx.config.debug) logger.warn(`平台 ${session.platform} 可能不支持OneBot API，尝试发送...`)
+                    }
+                    
+                    const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+                    
+                    // 查找forward元素中的id
+                    const forwardElement = quoted.elements.find(el => el.type === 'forward')
+                    const forwardId = forwardElement?.attrs?.id
+                    
+                    if (!forwardId) {
+                      if (ctx.config.debug) logger.warn(`未找到forward消息ID，跳过OneBot API处理`)
+                    } else {
+                      if (ctx.config.debug) logger.info(`找到forward ID: ${forwardId}，调用OneBot API...`)
+                      
+                      // 使用OneBot API获取合并转发消息内容
+                      let forwardData
+                      try {
+                        // 尝试通过bot的OneBot适配器调用API
+                        if (session.bot.platform === 'onebot') {
+                          // @ts-ignore
+                          forwardData = await session.bot.internal?.getForwardMsg?.(forwardId)
+                        } else if (session.bot.platform === 'qq') {
+                          // 对于QQ官方bot，可能需要不同的API调用方式
+                          // @ts-ignore  
+                          forwardData = await session.bot.internal?.getForwardMsg?.(forwardId)
+                        }
+                      } catch (apiError) {
+                        if (ctx.config.debug) logger.warn(`调用API失败: ${apiError}`)
+                      }
+                      
+                      if (ctx.config.debug) {
+                        logger.info(`OneBot getForwardMsg 返回数据:`, JSON.stringify(forwardData, null, 2))
+                      }
+                      
+                      if (forwardData && Array.isArray(forwardData)) {
+                        if (ctx.config.debug) logger.info(`成功获取到 ${forwardData.length} 条合并转发消息`)
+                        
+                        // 构造Koishi格式的合并转发消息
+                        const messageNodes = []
+                        
+                        // 将OneBot格式的消息转换为Koishi格式
+                        for (const msg of forwardData) {
+                          // 处理消息内容，OneBot返回的是content数组格式
+                          const messageElements = []
+                          if (Array.isArray(msg.content)) {
+                            // 处理content数组中的各种元素
+                            for (const segment of msg.content) {
+                              if (segment.type === 'text' && segment.data?.text) {
+                                messageElements.push(h('text', { content: segment.data.text }))
+                              } else if (segment.type === 'image' && segment.data?.url) {
+                                messageElements.push(h('img', { src: segment.data.url }))
+                              } else if (segment.type === 'video' && segment.data?.url) {
+                                messageElements.push(h('video', { src: segment.data.url }))
+                              } else if (segment.type === 'at' && segment.data?.qq) {
+                                messageElements.push(h('at', { id: segment.data.qq }))
+                              } else if (segment.type === 'face' && segment.data?.id) {
+                                messageElements.push(h('text', { content: `[表情${segment.data.id}]` }))
+                              } else if (segment.type === 'record' && segment.data?.url) {
+                                messageElements.push(h('audio', { src: segment.data.url }))
+                              } else if (segment.type === 'file' && segment.data?.url) {
+                                const fileName = segment.data.name || segment.data.file || '文件'
+                                messageElements.push(h('file', { src: segment.data.url, name: fileName }))
+                              } else {
+                                // 其他类型的消息段
+                                messageElements.push(h('text', { content: `[${segment.type}]` }))
+                              }
+                            }
+                          } else if (typeof msg.content === 'string') {
+                            messageElements.push(h('text', { content: msg.content }))
+                          } else {
+                            messageElements.push(h('text', { content: msg.message || '(无法解析的消息)' }))
+                          }
+                          
+                          messageNodes.push(h('message', {
+                            userId: msg.sender?.user_id?.toString() || 'unknown',
+                            nickname: msg.sender?.nickname || '未知用户'
+                          }, messageElements))
+                        }
+                        
+                        // 使用h('figure')构造合并转发
+                        const figureMessage = h('figure', {}, messageNodes)
+                        
+                        if (ctx.config.debug) {
+                          logger.info(`构造的figure消息:`, JSON.stringify(figureMessage, null, 2))
+                        }
+                        
+                        // 如果需要显示发送者，先发送发送者信息
+                        if (rule.showOriginalSender) {
+                          let targetDisplayName = sourceDisplayName
+                          try {
+                            const targetMember = await session.bot.getGuildMember(plainTargetId, originalUserId)
+                            if (targetMember?.name) targetDisplayName = targetMember.name
+                            else if (targetMember?.nick) targetDisplayName = targetMember.nick
+                          } catch (error) {
+                            if (ctx.config.debug) logger.info(`无法获取目标群昵称，使用源群昵称`)
+                          }
+                          
+                          // 先发送发送者信息
+                          await session.bot.sendMessage(plainTargetId, `${targetDisplayName} 发送了一个转发消息`)
+                        }
+                        
+                        // 发送合并转发消息
+                        const result = await session.bot.sendMessage(plainTargetId, figureMessage)
+                        if (ctx.config.debug) logger.info(`figure发送返回结果:`, JSON.stringify(result, null, 2))
+                        
+                        if (result && result.length > 0) {
+                          successCount++
+                          if (ctx.config.debug) logger.info(`[成功] 使用OneBot API成功转发合并转发消息到 ${targetChannelId}`)
+                          continue
+                        } else {
+                          if (ctx.config.debug) logger.warn(`figure方式可能成功但未返回有效结果`)
+                          // 有些情况下发送成功但不返回标准格式
+                          if (result !== null && result !== undefined) {
+                            successCount++
+                            if (ctx.config.debug) logger.info(`[成功] OneBot API转发可能已成功到 ${targetChannelId}`)
+                            continue
+                          }
+                        }
+                        } else {
+                          if (ctx.config.debug) logger.warn(`OneBot API返回的数据不是数组格式: ${typeof forwardData}`)
+                        }
+                    }
+                  } catch (error) {
+                    if (ctx.config.debug) logger.warn(`OneBot API处理失败: ${error}，回退到文本模式`)
+                  }
+                }
+              }
+              
+              // 普通文本消息转发
+              if (ctx.config.debug) logger.info(`尝试普通文本转发到: ${targetChannelId}`)
+              const sentMessageIds = await ctx.broadcast([targetChannelId], finalMessage)
+              if (ctx.config.debug) logger.info(`普通转发broadcast返回的消息ID: ${JSON.stringify(sentMessageIds)}`)
+              if (sentMessageIds.length > 0) {
+                successCount++
+                if (ctx.config.debug) logger.info(`[成功] 消息已转发到 ${targetChannelId}`)
+              } else {
+                logger.warn(`[失败] 转发到频道 ${targetChannelId} 失败（Broadcast未返回ID）。`)
+              }
+            } catch (error) {
+              logger.error(`[失败] 转发到频道 ${targetChannelId} 时发生错误:`, error)
+            }
+          }
+          if (ctx.config.debug) logger.info(`(引用转发) 指令 "${rule.commandName}" 完成：成功 ${successCount}/${targets.length}`)
+          
+          // 根据配置决定是否发送成功消息
+          if (rule.showSuccessMessage) {
+            return successCount > 0 ? '消息已成功转发。' : '发送失败，请检查机器人权限与日志。'
+          }
+          // 不发送成功消息时，返回空字符串（不显示任何回复）
+          return ''
+        })
+    }
+  }
 }

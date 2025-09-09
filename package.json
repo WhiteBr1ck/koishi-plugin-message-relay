@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-message-relay",
-  "version": "1.0.0",
-  "description": "一个在不同群组之间，监控并同步用户消息的 Koishi 插件。",
+  "version": "1.1.0",
+  "description": "一个在不同群组之间，监控并同步用户消息的 Koishi 插件。支持指令调用。",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -29,11 +29,11 @@
     "group"
   ],
   "peerDependencies": {
-    "koishi": "^4.0.0"
+    "koishi": "^4.18.7"
   },
   "koishi": {
     "description": {
-      "zh": "传声筒，用于在不同群组之间监控并同步某个用户的发言，支持手动指引 bot 发送特定消息。"
+      "zh": "传声筒，用于在不同群组之间监控并同步某个用户的发言，支持手动指引 bot 发送特定消息。新增引用转发功能，可以通过指令一键将消息转发到指定群聊。"
     }
   }
 }
