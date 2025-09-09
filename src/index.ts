@@ -289,10 +289,13 @@ export function apply(ctx: Context, config: Config) {
             try {
               // 对于引用的消息，如果是合并转发等特殊消息，使用OneBot API获取内容
               if (isQuotedMessage && quoted.elements && quoted.elements.length > 0) {
-                if (ctx.config.debug) logger.info(`检测到引用消息有elements，尝试合并转发处理...`)
+                if (ctx.config.debug) logger.info(`检测到引用消息有elements，尝试特殊消息处理...`)
                 
                 // 检查是否包含forward元素
                 const hasForwardElement = quoted.elements.some(el => el.type === 'forward')
+                const hasJsonElement = quoted.elements.some(el => el.type === 'json')
+                const hasFileElement = quoted.elements.some(el => el.type === 'file')
+                
                 if (hasForwardElement) {
                   if (ctx.config.debug) logger.info(`检测到forward元素，使用OneBot API获取合并转发内容...`)
                   
@@ -423,6 +426,156 @@ export function apply(ctx: Context, config: Config) {
                     }
                   } catch (error) {
                     if (ctx.config.debug) logger.warn(`OneBot API处理失败: ${error}，回退到文本模式`)
+                  }
+                } else if (hasJsonElement) {
+                  if (ctx.config.debug) logger.info(`检测到json元素（QQ小程序），尝试提取链接...`)
+                  
+                  try {
+                    const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+                    
+                    // 查找json元素
+                    const jsonElement = quoted.elements.find(el => el.type === 'json')
+                    if (jsonElement && jsonElement.attrs?.data) {
+                      if (ctx.config.debug) logger.info(`找到json数据，尝试解析链接...`)
+                      
+                      // 解析 JSON 数据
+                      const jsonData = JSON.parse(jsonElement.attrs.data)
+                      if (ctx.config.debug) logger.info(`解析的JSON数据:`, JSON.stringify(jsonData, null, 2))
+                      
+                      // 提取链接信息
+                      let linkMessage = ''
+                      const title = jsonData.meta?.detail_1?.title || '未知应用'
+                      const desc = jsonData.meta?.detail_1?.desc || jsonData.prompt || ''
+                      
+                      // 优先使用 qqdocurl，其次使用 url
+                      let linkUrl = ''
+                      if (jsonData.meta?.detail_1?.qqdocurl) {
+                        linkUrl = jsonData.meta.detail_1.qqdocurl
+                      } else if (jsonData.meta?.detail_1?.url) {
+                        linkUrl = jsonData.meta.detail_1.url
+                        // 如果url不是完整链接，添加协议
+                        if (!linkUrl.startsWith('http')) {
+                          linkUrl = 'https://' + linkUrl
+                        }
+                      }
+                      
+                      if (linkUrl) {
+                        linkMessage = `【${title}】${desc}\n${linkUrl}`
+                      } else {
+                        linkMessage = `【${title}】${desc}\n(未找到可用链接)`
+                      }
+                      
+                      if (ctx.config.debug) logger.info(`提取的链接信息: "${linkMessage}"`)
+                      
+                      // 如果需要显示发送者，添加发送者信息到链接消息中
+                      let finalLinkMessage = linkMessage
+                      if (rule.showOriginalSender) {
+                        let targetDisplayName = sourceDisplayName
+                        try {
+                          const targetMember = await session.bot.getGuildMember(plainTargetId, originalUserId)
+                          if (targetMember?.name) targetDisplayName = targetMember.name
+                          else if (targetMember?.nick) targetDisplayName = targetMember.nick
+                        } catch (error) {
+                          if (ctx.config.debug) logger.info(`无法获取目标群昵称，使用源群昵称`)
+                        }
+                        
+                        finalLinkMessage = `${targetDisplayName} 分享了：\n${linkMessage}`
+                      }
+                      
+                      // 发送链接消息
+                      const result = await session.bot.sendMessage(plainTargetId, finalLinkMessage)
+                      if (ctx.config.debug) logger.info(`链接发送返回结果:`, JSON.stringify(result, null, 2))
+                      
+                      if (result && result.length > 0) {
+                        successCount++
+                        if (ctx.config.debug) logger.info(`[成功] 成功转发QQ小程序链接到 ${targetChannelId}`)
+                        continue
+                      } else {
+                        if (ctx.config.debug) logger.warn(`链接发送可能成功但未返回有效结果`)
+                        // 有些情况下发送成功但不返回标准格式
+                        if (result !== null && result !== undefined) {
+                          successCount++
+                          if (ctx.config.debug) logger.info(`[成功] QQ小程序链接转发可能已成功到 ${targetChannelId}`)
+                          continue
+                        }
+                      }
+                    } else {
+                      if (ctx.config.debug) logger.warn(`json元素没有data属性`)
+                    }
+                  } catch (error) {
+                    if (ctx.config.debug) logger.warn(`QQ小程序链接解析失败: ${error}，回退到文本模式`)
+                  }
+                } else if (hasFileElement) {
+                  if (ctx.config.debug) logger.info(`检测到file元素，暂不支持文件转发`)
+                  
+                  try {
+                    const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+                    
+                    // 查找file元素
+                    const fileElement = quoted.elements.find(el => el.type === 'file')
+                    if (fileElement && fileElement.attrs) {
+                      if (ctx.config.debug) logger.info(`找到文件数据:`, JSON.stringify(fileElement.attrs, null, 2))
+                      
+                      // 提取文件信息
+                      const fileName = fileElement.attrs.file || fileElement.attrs.src || '未知文件'
+                      const fileSize = fileElement.attrs.fileSize || '未知大小'
+                      const fileId = fileElement.attrs.fileId || ''
+                      
+                      // 格式化文件大小
+                      let formattedSize = fileSize
+                      if (typeof fileSize === 'string' && !isNaN(Number(fileSize))) {
+                        const sizeInBytes = Number(fileSize)
+                        if (sizeInBytes >= 1024 * 1024) {
+                          formattedSize = `${(sizeInBytes / (1024 * 1024)).toFixed(2)} MB`
+                        } else if (sizeInBytes >= 1024) {
+                          formattedSize = `${(sizeInBytes / 1024).toFixed(2)} KB`
+                        } else {
+                          formattedSize = `${sizeInBytes} B`
+                        }
+                      }
+                      
+                      // 构造文件信息消息
+                      let fileInfoMessage = `📁 文件: ${fileName}\n📏 大小: ${formattedSize}`
+                      if (fileId) {
+                        fileInfoMessage += `\n🆔 文件ID: ${fileId}`
+                      }
+                      fileInfoMessage += `\n⚠️ 注意: 暂不支持文件转发，请手动下载后重新发送`
+                      
+                      // 如果需要显示发送者，添加发送者信息
+                      if (rule.showOriginalSender) {
+                        let targetDisplayName = sourceDisplayName
+                        try {
+                          const targetMember = await session.bot.getGuildMember(plainTargetId, originalUserId)
+                          if (targetMember?.name) targetDisplayName = targetMember.name
+                          else if (targetMember?.nick) targetDisplayName = targetMember.nick
+                        } catch (error) {
+                          if (ctx.config.debug) logger.info(`无法获取目标群昵称，使用源群昵称`)
+                        }
+                        
+                        fileInfoMessage = `${targetDisplayName} 发送了一个文件：\n${fileInfoMessage}`
+                      }
+                      
+                      // 发送文件信息
+                      const result = await session.bot.sendMessage(plainTargetId, fileInfoMessage)
+                      if (ctx.config.debug) logger.info(`文件信息发送返回结果:`, JSON.stringify(result, null, 2))
+                      
+                      if (result && result.length > 0) {
+                        successCount++
+                        if (ctx.config.debug) logger.info(`[成功] 文件信息已发送到 ${targetChannelId}`)
+                        continue
+                      } else {
+                        if (ctx.config.debug) logger.warn(`文件信息发送可能成功但未返回有效结果`)
+                        if (result !== null && result !== undefined) {
+                          successCount++
+                          if (ctx.config.debug) logger.info(`[成功] 文件信息可能已成功发送到 ${targetChannelId}`)
+                          continue
+                        }
+                      }
+                    } else {
+                      if (ctx.config.debug) logger.warn(`file元素没有attrs属性`)
+                    }
+                  } catch (error) {
+                    if (ctx.config.debug) logger.warn(`文件信息处理失败: ${error}`)
                   }
                 }
               }
