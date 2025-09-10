@@ -64,6 +64,114 @@ export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('message-relay')
   logger.info('传声筒插件已启动。')
 
+  // MIME类型检测函数
+  function getMimeType(buffer: Buffer): string {
+    if (buffer.length < 4) return 'application/octet-stream'
+    
+    const header = buffer.toString('hex', 0, 4)
+    if (header.startsWith('89504e47')) return 'image/png'
+    if (header.startsWith('ffd8ff')) return 'image/jpeg'
+    if (header.startsWith('47494638')) return 'image/gif'
+    if (buffer.toString('ascii', 0, 4) === 'RIFF') return 'image/webp'
+    
+    // 视频格式检测
+    if (header.startsWith('00000020') || header.startsWith('00000018')) return 'video/mp4'
+    if (header.startsWith('1a45dfa3')) return 'video/webm'
+    
+    // 音频格式检测
+    if (header.startsWith('494433') || header.startsWith('fff3') || header.startsWith('fff2')) return 'audio/mpeg'
+    if (header.startsWith('4f676753')) return 'audio/ogg'
+    
+    return 'application/octet-stream'
+  }
+
+  // 元素检查函数
+  function hasFileElement(elements: any[]): boolean {
+    if (!Array.isArray(elements)) return false
+    return elements.some(el => {
+      const type = el?.type || el?.name
+      return type === 'file'
+    })
+  }
+
+  function hasAudioElement(elements: any[]): boolean {
+    if (!Array.isArray(elements)) return false
+    return elements.some(el => {
+      const type = el?.type || el?.name
+      return ['audio', 'record'].includes(type)
+    })
+  }
+
+  function hasMfaceElement(elements: any[]): boolean {
+    if (!Array.isArray(elements)) return false
+    return elements.some(el => {
+      const type = el?.type || el?.name
+      return type === 'mface'
+    })
+  }
+
+  function hasMediaElement(elements: any[]): boolean {
+    if (!Array.isArray(elements)) return false
+    return elements.some(el => {
+      const type = el?.type || el?.name
+      return ['img', 'image', 'video'].includes(type) // 移除 audio 和 record
+    })
+  }
+
+  // 当 content 为空时，从 elements 兜底生成可读文本
+  function stringifyElementsAsText(elements: any[]): string {
+    if (!Array.isArray(elements)) return ''
+    const parts: string[] = []
+    for (const el of elements) {
+      const type = el?.type || el?.name
+      const attrs = el?.attrs || el || {}
+      switch (type) {
+        case 'text':
+          parts.push(attrs.content ?? (Array.isArray(el.children) ? el.children.join('') : '') ?? '')
+          break
+        case 'at':
+          parts.push(`@${attrs.name || attrs.id || attrs.qq || ''}`)
+          break
+        case 'img':
+        case 'image':
+          parts.push('[图片]')
+          break
+        case 'video':
+          parts.push('[视频]')
+          break
+        case 'audio':
+        case 'record':
+          parts.push('[语音]')
+          break
+        case 'file':
+          parts.push(`[文件${attrs.name ? '：' + attrs.name : ''}]`)
+          break
+        case 'face':
+          parts.push(`[表情${attrs.id ?? ''}]`)
+          break
+        case 'mface':
+          parts.push(attrs.summary || '[表情包]')
+          break
+        case 'json':
+          parts.push('[小程序]')
+          break
+        case 'forward':
+          parts.push('[合并转发]')
+          break
+        default:
+          if (Array.isArray(el?.children) && el.children.length) {
+            parts.push(stringifyElementsAsText(el.children))
+          } else if (attrs?.text) {
+            parts.push(attrs.text)
+          } else if (type) {
+            parts.push(`[${type}]`)
+          }
+          break
+      }
+    }
+    return parts.join('')
+  }
+
 
   const middlewareDispose = ctx.middleware(async (session, next) => {
     await next()
@@ -71,8 +179,17 @@ export function apply(ctx: Context, config: Config) {
     const fullSessionUserId = `${session.platform}:${session.userId}`
     const matchedRule = currentConfig.monitoringRules.find(rule => rule.userId === fullSessionUserId)
     if (!matchedRule) return
-    const hasKeyword = matchedRule.keywords.length === 0 || matchedRule.keywords.some(kw => session.content.includes(kw))
+    
+    // 生成完整消息文本用于关键词匹配
+    const messageText = session.content || stringifyElementsAsText(session.elements)
+    const hasKeyword = matchedRule.keywords.length === 0 || matchedRule.keywords.some(kw => messageText.includes(kw))
     if (!hasKeyword) return
+    
+    // 检查是否有文件或语音，如果有则不进行转发
+    if (hasFileElement(session.elements) || hasAudioElement(session.elements)) {
+      return // 有文件或语音的消息不转发
+    }
+    
     let sourceSenderDisplayName = session.username
     try {
       const member = await session.bot.getGuildMember(session.guildId, session.userId)
@@ -96,15 +213,65 @@ export function apply(ctx: Context, config: Config) {
       } catch (error) {
         if (ctx.config.debug) logger.info(`无法获取用户在目标频道 ${targetChannelId} 的昵称，将使用源群聊昵称。`)
       }
-      const messageForThisChannel = `${targetSenderDisplayName}：${session.content}`
+      
       try {
-        const sentMessageIds = await ctx.broadcast([targetChannelId], messageForThisChannel)
-        if (sentMessageIds.length > 0) {
-          if (ctx.config.debug) logger.info(`[成功] 已将消息转发到 ${targetChannelId}`)
-          successCount++
+        // 检查是否有媒体内容需要特殊处理
+        if (hasMfaceElement(session.elements) || hasMediaElement(session.elements)) {
+          // 处理媒体内容
+          const processedElements = []
+          const usernameElement = h.text(`${targetSenderDisplayName}：`)
+          processedElements.push(usernameElement)
+          
+          for (const element of session.elements) {
+            const type = element?.type
+            const attrs = element?.attrs || {}
+            
+            if (type === 'mface' && (attrs as any).url) {
+              try {
+                const response = await ctx.http.get((attrs as any).url, { responseType: 'arraybuffer' })
+                const buffer = Buffer.from(response)
+                const mimeType = getMimeType(buffer)
+                const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`
+                processedElements.push(h.image(dataUrl))
+              } catch (err) {
+                logger.warn(`下载表情包失败: ${err.message}`)
+                processedElements.push(h.text((attrs as any).summary || '[表情包]'))
+              }
+            } else if (['img', 'image', 'video'].includes(type) && (attrs as any).src) {
+              try {
+                const response = await ctx.http.get((attrs as any).src, { responseType: 'arraybuffer' })
+                const buffer = Buffer.from(response)
+                const mimeType = getMimeType(buffer)
+                const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`
+                
+                if (type === 'video') {
+                  processedElements.push(h.video(dataUrl))
+                } else {
+                  processedElements.push(h.image(dataUrl))
+                }
+              } catch (err) {
+                logger.warn(`下载媒体失败: ${err.message}`)
+                processedElements.push(h.text(`[${type}]`))
+              }
+            } else {
+              processedElements.push(element)
+            }
+          }
+          
+          const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+          await session.bot.sendMessage(plainTargetId, processedElements)
         } else {
-          logger.warn(`[失败] 转发到频道 ${targetChannelId} 失败（Broadcast未返回ID）。`)
+          // 普通消息直接发送文本
+          const messageForThisChannel = `${targetSenderDisplayName}：${messageText}`
+          const sentMessageIds = await ctx.broadcast([targetChannelId], messageForThisChannel)
+          if (sentMessageIds.length === 0) {
+            logger.warn(`[失败] 转发到频道 ${targetChannelId} 失败（Broadcast未返回ID）。`)
+            continue
+          }
         }
+        
+        if (ctx.config.debug) logger.info(`[成功] 已将消息转发到 ${targetChannelId}`)
+        successCount++
       } catch (error) {
         logger.error(`[失败] 转发到频道 ${targetChannelId} 时发生错误:`, error)
       }
@@ -291,10 +458,149 @@ export function apply(ctx: Context, config: Config) {
               if (isQuotedMessage && quoted.elements && quoted.elements.length > 0) {
                 if (ctx.config.debug) logger.info(`检测到引用消息有elements，尝试特殊消息处理...`)
                 
-                // 检查是否包含forward元素
+                // 检查是否包含特殊元素
                 const hasForwardElement = quoted.elements.some(el => el.type === 'forward')
                 const hasJsonElement = quoted.elements.some(el => el.type === 'json')
                 const hasFileElement = quoted.elements.some(el => el.type === 'file')
+                const hasAudioElement = quoted.elements.some(el => ['audio', 'record'].includes(el.type))
+                const hasMfaceElement = quoted.elements.some(el => el.type === 'mface') // 表情包
+                const hasMediaElement = quoted.elements.some(el => ['img', 'image', 'video'].includes(el.type))
+                
+                // 处理文件消息 - 直接提示无法转发
+                if (hasFileElement) {
+                  if (ctx.config.debug) logger.info(`检测到文件元素，提示无法转发`)
+                  
+                  const fileElement = quoted.elements.find(el => el.type === 'file')
+                  const fileName = fileElement?.attrs?.file || fileElement?.attrs?.src || '未知文件'
+                  const fileSize = fileElement?.attrs?.fileSize
+                  
+                  // 格式化文件大小
+                  let formattedSize = '未知大小'
+                  if (fileSize && !isNaN(Number(fileSize))) {
+                    const sizeInBytes = Number(fileSize)
+                    if (sizeInBytes >= 1024 * 1024) {
+                      formattedSize = `${(sizeInBytes / (1024 * 1024)).toFixed(2)} MB`
+                    } else if (sizeInBytes >= 1024) {
+                      formattedSize = `${(sizeInBytes / 1024).toFixed(2)} KB`
+                    } else {
+                      formattedSize = `${sizeInBytes} B`
+                    }
+                  }
+                  
+                  // 直接返回提示消息，不转发
+                  return `⚠️ 检测到文件消息，暂不支持转发\n📁 文件: ${fileName}\n📏 大小: ${formattedSize}`
+                }
+                
+                // 处理语音消息 - 直接提示无法转发
+                if (hasAudioElement) {
+                  if (ctx.config.debug) logger.info(`检测到语音元素，提示无法转发`)
+                  
+                  const audioElement = quoted.elements.find(el => ['audio', 'record'].includes(el.type))
+                  const fileName = audioElement?.attrs?.file || '未知语音文件'
+                  const fileSize = audioElement?.attrs?.fileSize
+                  
+                  // 格式化文件大小
+                  let formattedSize = '未知大小'
+                  if (fileSize && !isNaN(Number(fileSize))) {
+                    const sizeInBytes = Number(fileSize)
+                    if (sizeInBytes >= 1024 * 1024) {
+                      formattedSize = `${(sizeInBytes / (1024 * 1024)).toFixed(2)} MB`
+                    } else if (sizeInBytes >= 1024) {
+                      formattedSize = `${(sizeInBytes / 1024).toFixed(2)} KB`
+                    } else {
+                      formattedSize = `${sizeInBytes} B`
+                    }
+                  }
+                  
+                  // 直接返回提示消息，不转发
+                  return `🔇 检测到语音消息，暂不支持转发\n🎵 文件: ${fileName}\n📏 大小: ${formattedSize}`
+                }
+                
+                // 处理表情包和富媒体消息
+                if (hasMfaceElement || hasMediaElement) {
+                  if (ctx.config.debug) logger.info(`检测到表情包或富媒体元素，尝试下载并重新发送...`)
+                  
+                  try {
+                    const plainTargetId = targetChannelId.split(':')[1] || targetChannelId
+                    
+                    // 构造完整消息内容
+                    let messagesToSend = []
+                    
+                    // 添加发送者信息（如果需要）
+                    if (rule.showOriginalSender) {
+                      let targetDisplayName = sourceDisplayName
+                      try {
+                        const targetMember = await session.bot.getGuildMember(plainTargetId, originalUserId)
+                        if (targetMember?.name) targetDisplayName = targetMember.name
+                        else if (targetMember?.nick) targetDisplayName = targetMember.nick
+                      } catch (error) {
+                        if (ctx.config.debug) logger.info(`无法获取目标群昵称，使用源群昵称`)
+                      }
+                      messagesToSend.push(h('text', { content: `${targetDisplayName}：` }))
+                    }
+                    
+                    // 处理所有元素，组合成完整消息
+                    for (const element of quoted.elements) {
+                      if (element.type === 'text') {
+                        // 添加文本内容
+                        if (element.attrs?.content) {
+                          messagesToSend.push(h('text', { content: element.attrs.content }))
+                        }
+                      } else if (['mface', 'img', 'image', 'video'].includes(element.type)) {
+                        try {
+                          // 获取媒体URL
+                          let url = element.attrs?.url || element.attrs?.src
+                          if (!url) {
+                            if (ctx.config.debug) logger.warn(`元素缺少URL: ${element.type}`)
+                            // 添加占位符文本
+                            messagesToSend.push(h('text', { content: `[${element.type}]` }))
+                            continue
+                          }
+                          
+                          if (ctx.config.debug) logger.info(`开始下载: ${element.type}, URL: ${url}`)
+                          
+                          // 下载媒体文件
+                          const response = await ctx.http.get(url, { responseType: 'arraybuffer', timeout: 15000 })
+                          const buffer = Buffer.from(response)
+                          
+                          // 检测MIME类型
+                          const mime = getMimeType(buffer)
+                          
+                          if (ctx.config.debug) logger.info(`下载完成: ${mime}, 大小: ${buffer.length}`)
+                          
+                          // 添加媒体内容
+                          if (element.type === 'mface' || element.type === 'img' || element.type === 'image') {
+                            messagesToSend.push(h('img', { src: `data:${mime};base64,${buffer.toString('base64')}` }))
+                          } else if (element.type === 'video') {
+                            messagesToSend.push(h('video', { src: `data:${mime};base64,${buffer.toString('base64')}` }))
+                          }
+                          
+                        } catch (err) {
+                          logger.warn(`下载${element.type}失败: ${err.message}`)
+                          // 添加错误占位符
+                          messagesToSend.push(h('text', { content: `[${element.type}-下载失败]` }))
+                        }
+                      } else {
+                        // 其他类型元素直接添加
+                        messagesToSend.push(element)
+                      }
+                    }
+                    
+                    // 一次性发送完整消息
+                    const result = await session.bot.sendMessage(plainTargetId, messagesToSend)
+                    if (ctx.config.debug) logger.info(`完整消息发送结果:`, JSON.stringify(result, null, 2))
+                    
+                    if (result && result.length > 0) {
+                      successCount++
+                      if (ctx.config.debug) logger.info(`[成功] 完整消息已转发到 ${targetChannelId}`)
+                      continue
+                    }
+                    
+                  } catch (error) {
+                    if (ctx.config.debug) logger.error(`媒体转发失败: ${error}`)
+                    // 失败时继续使用文本转发作为兜底
+                  }
+                }
                 
                 if (hasForwardElement) {
                   if (ctx.config.debug) logger.info(`检测到forward元素，使用OneBot API获取合并转发内容...`)
